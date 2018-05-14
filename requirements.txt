@@ -1,1 +1,2 @@
 PyYAML==3.12
+docker==3.3.0
