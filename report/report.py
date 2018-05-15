@@ -18,7 +18,7 @@ from classes.notice import Notice
 from classes.package import Package
 from command_lib import command_lib
 import common
-import docker
+import docker_utils
 
 '''
 Create a report
