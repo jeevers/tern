@@ -3,7 +3,7 @@ Copyright (c) 2017 VMware, Inc. All Rights Reserved.
 SPDX-License-Identifier: BSD-2-Clause
 '''
 import grp
-import io
+# import io
 import logging
 import os
 import pwd
@@ -11,12 +11,15 @@ import subprocess
 import tarfile
 import time
 
+import docker
 
 from .constants import container
 from .constants import logger_name
 from .constants import temp_folder
 
 from .general import pushd
+
+DOCKER_CLIENT = docker.from_env()
 
 '''
 Container operations
@@ -61,7 +64,7 @@ def docker_command(command, *extra):
     for arg in extra:
         full_cmd.append(arg)
     # invoke
-    logger.debug("Running command: " + ' '.join(full_cmd))
+    logger.debug("Running command: %s", ' '.join(full_cmd))
     pipes = subprocess.Popen(full_cmd, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE)
     result, error = pipes.communicate()
@@ -74,21 +77,30 @@ def docker_command(command, *extra):
 def check_container():
     '''Check if a container exists'''
     is_container = False
-    keyvalue = 'name=' + container
-    result = docker_command(check_running, '--filter', keyvalue)
-    result_lines = result.decode('utf-8').split('\n')
-    if len(result_lines) > 2:
+    try:
+        container_id = DOCKER_CLIENT.containers.get(container)
+        logger.debug("Found container %s with ID %s",
+                     container,
+                     container_id)
         is_container = True
+    except docker.errors.NotFound:
+        logger.debug("Container %s not found", container)
+        is_container = False
     return is_container
 
 
 def check_image(image_tag_string):
     '''Check if image exists'''
     is_image = False
-    result = docker_command(check_images, image_tag_string)
-    result_lines = result.decode('utf-8').split('\n')
-    if len(result_lines) > 2:
+    try:
+        image_id = DOCKER_CLIENT.images.get(image_tag_string)
+        logger.debug("Found image %s with ID %s",
+                     image_tag_string,
+                     image_id)
         is_image = True
+    except docker.errors.NotFound:
+        logger.debug("Image %s not found", image_tag_string)
+        is_image = False
     return is_image
 
 
@@ -96,11 +108,11 @@ def pull_image(image_tag_string):
     '''Try to pull an image from Dockerhub'''
     is_there = False
     try:
-        result = docker_command(pull, image_tag_string)
-        print(result)
+        image = DOCKER_CLIENT.images.pull(image_tag_string)
+        print(image.attrs['Id'])
         is_there = True
-    except subprocess.CalledProcessError as error:
-        print(error.output)
+    except docker.errors.ImageNotFound as error:
+        print(error)
         is_there = False
     return is_there
 
@@ -108,18 +120,15 @@ def pull_image(image_tag_string):
 def build_container(dockerfile, image_tag_string):
     '''Invoke docker command to build a docker image from the dockerfile
     It is assumed that docker is installed and the docker daemon is running'''
-    curr_path = os.getcwd()
     path = os.path.dirname(dockerfile)
     if not check_image(image_tag_string):
         with pushd(path):
             try:
-                docker_command(build, '-t', image_tag_string, '-f',
-                               os.path.basename(dockerfile), '.')
-            except subprocess.CalledProcessError as error:
-                os.chdir(curr_path)
-                raise subprocess.CalledProcessError(
-                    error.returncode, cmd=error.cmd,
-                    output=error.output.decode('utf-8'))
+                DOCKER_CLIENT.images.build(tag=image_tag_string,
+                                           path=os.path.basename(dockerfile),
+                                           rm=True)
+            except docker.errors.BuildError as error:
+                raise docker.errors.BuildError(error)
 
 
 def start_container(image_tag_string):
@@ -129,35 +138,47 @@ def start_container(image_tag_string):
     Assumptions: Docker is installed and the docker daemon is running
     There is no other running container from the given image'''
     if check_container():
-        docker_command(stop, container)
-        docker_command(remove, container)
-    docker_command(run, '--name', container, image_tag_string)
+        c = DOCKER_CLIENT.container.get(container)
+        c.stop()
+        c.remove()
+    DOCKER_CLIENT.containers.run(name=container,
+                                 tag=image_tag_string,
+                                 detach=True)
 
 
 def remove_container():
     '''Remove a running container'''
     if check_container():
-        docker_command(stop, container)
-        docker_command(remove, container)
+        c = DOCKER_CLIENT.container.get(container)
+        c.stop()
+        c.remove()
 
 
 def remove_image(image_tag_string):
     '''Remove an image'''
     if check_image(image_tag_string):
-        docker_command(delete, image_tag_string)
+        DOCKER_CLIENT.images.remove(image_tag_string)
 
 
 def get_image_id(image_tag_string):
     '''Get the image ID by inspecting the image'''
-    result = docker_command(inspect, "-f'{{json .Id}}'", image_tag_string)
-    return result.split(':').pop()
+    image = DOCKER_CLIENT.images.get(image_tag_string)
+    return image.split(':').pop()
 
 
 def extract_image_metadata(image_tag_string):
     '''Run docker save and extract the files in a temporary directory'''
     temp_path = os.path.abspath(temp_folder)
-    result = docker_command(save, image_tag_string)
-    with tarfile.open(fileobj=io.BytesIO(result)) as tar:
+    tar_path = os.path.join(temp_path,
+                            "{}.tar".format(image_tag_string.replace(":", "_")))
+    image = DOCKER_CLIENT.image.get(image_tag_string)
+    with open(tar_path, 'wb') as f:
+        for chunk in image.save(chunk_size=None):
+            # chunk_size=None streams the image
+            f.write(chunk)
+    with tarfile.open(tar_path) as tar:
         tar.extractall(temp_path)
     if not os.path.exists(temp_path):
         raise IOError('Unable to untar Docker image')
+    # clean up the extracted tarfile
+    os.remove(tar_path)
